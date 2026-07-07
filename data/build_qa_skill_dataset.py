@@ -225,32 +225,19 @@ def molecule_evidence(
 
 
 def build_prompt(record: dict[str, Any]) -> str:
+    # Base prompt = augment_with_skill_kb.build_prompt WITHOUT the retrieved-evidence
+    # block, so eval (raw question) and each method's TRAIN prompt differ only by
+    # that block. No task/input-type metadata and no dataset-level retrieval dump.
     lines = [
-        "You are answering a drug and molecular QA task.",
-        "Use the retrieved evidence when it is relevant, but do not invent facts not supported by the question or evidence.",
-        "Return only the final answer in the same style as the gold answer.",
+        "You are answering a drug and molecular QA task with external knowledge.",
         "",
-        f"Task: {record['task_type']}",
-        f"Input type: {record['input_type']}",
+        "Use the provided information to answer the question. If the answer is not available, respond: Information not found!",
+        "",
+        "Answer in the same style as the gold answer.",
     ]
     if record["input_molecule_or_context"]:
-        lines.append(f"Input: {record['input_molecule_or_context']}")
-    if record.get("decoded_smiles"):
-        lines.append(f"Decoded SMILES: {record['decoded_smiles']}")
-    lines.extend(["", "Retrieved molecule evidence:"])
-    mol_evidence = record.get("retrieved_molecule_evidence") or []
-    if mol_evidence:
-        for idx, item in enumerate(mol_evidence, 1):
-            lines.append(f"{idx}. {item['question']} -> {item['answer']}")
-    else:
-        lines.append("No matched molecule evidence found.")
-    lines.extend(["", "Retrieved KG evidence:"])
-    kg_evidence = record.get("retrieved_kg_evidence") or []
-    if kg_evidence:
-        for idx, edge in enumerate(kg_evidence, 1):
-            lines.append(f"{idx}. {edge['x_name']} --{edge['relation']}--> {edge['y_name']}")
-    else:
-        lines.append("No matched KG evidence found.")
+        label = "Label/context evidence" if record.get("source") == "fdarxbench" else "Input"
+        lines.extend(["", f"{label}:", record["input_molecule_or_context"]])
     lines.extend(["", f"Question: {record['question']}", "Answer:"])
     return "\n".join(lines)
 

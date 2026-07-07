@@ -126,16 +126,18 @@ def build_mol_instructions(args: argparse.Namespace, output_dir: Path) -> dict[s
 
 
 def fdarx_prompt(record: dict[str, Any]) -> str:
+    # Base prompt = augment_with_skill_kb.build_prompt WITHOUT the retrieved-evidence
+    # block. Every method is evaluated on exactly this (raw dataset question); each
+    # retrieval method's TRAIN prompt is this + a "Retrieved KB evidence" block.
     lines = [
-        "You are answering an FDA drug-label QA task.",
-        "Use the provided label evidence when it is present.",
-        "If the answer is not in the evidence, answer: Information not found!",
+        "You are answering a drug and molecular QA task with external knowledge.",
         "",
-        f"Task: {record['task_type']}",
-        f"Drug: {record['drug_name']}",
+        "Use the provided information to answer the question. If the answer is not available, respond: Information not found!",
+        "",
+        "Answer in the same style as the gold answer.",
     ]
     if record["input_molecule_or_context"]:
-        lines.extend(["", "Label evidence:", record["input_molecule_or_context"]])
+        lines.extend(["", "Label/context evidence:", record["input_molecule_or_context"]])
     lines.extend(["", f"Question: {record['question']}", "Answer:"])
     return "\n".join(lines)
 

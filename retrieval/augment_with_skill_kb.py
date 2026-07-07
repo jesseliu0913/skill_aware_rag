@@ -96,58 +96,74 @@ LEGACY_SKILL_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+# Six task-aligned skills. Each is a typed record: which KB sources/relations the
+# skill-based retriever may use, its evidence budget top_k (>0 for every skill, so
+# each task still retrieves and the retrieval baselines have something to compare
+# against), the ordered solving STEPS shown to the model, and the answer format.
 SKILL_SCHEMA_V1: dict[str, dict[str, Any]] = {
     "fda_label_factual": {
         "required_slots": ("label_context",),
         "sources": {"fdarxbench_label"},
         "relations": {"label_context"},
         "top_k": 3,
+        "steps": (
+            "Locate the label section relevant to the question.",
+            "Extract the exact fact asked for (event, dose, contraindication, population, ...).",
+            "Answer concisely, grounded only in the label text.",
+        ),
         "answer_format": "short_label_grounded_answer",
-        "abstention_policy": "abstain_if_label_missing",
     },
     "fda_label_multihop": {
         "required_slots": ("label_context_primary", "label_context_secondary"),
         "sources": {"fdarxbench_label"},
         "relations": {"label_context"},
         "top_k": 4,
+        "steps": (
+            "Identify the two or more label sections the question connects.",
+            "Extract the key fact from each section.",
+            "Combine them into one coherent, grounded answer.",
+        ),
         "answer_format": "synthesized_label_answer",
-        "abstention_policy": "abstain_if_any_required_label_missing",
-    },
-    "fda_label_refusal": {
-        "required_slots": ("label_context_check", "unsupported_flag"),
-        "sources": {"fdarxbench_label"},
-        "relations": {"label_context"},
-        "top_k": 2,
-        "answer_format": "information_not_found_or_label_answer",
-        "abstention_policy": "prefer_abstention_when_unsupported",
     },
     "molecule_property_numeric": {
         "required_slots": ("molecule_structure", "property_definition"),
-        "sources": set(),
-        "relations": set(),
-        "top_k": 0,
+        "sources": {"drugchat_pubchem", "drugchat_chembl"},
+        "relations": {"instruction_fact"},
+        "top_k": 3,
+        "steps": (
+            "Read the molecular structure from the SELFIES/SMILES string.",
+            "Identify the requested property (e.g., HOMO-LUMO gap, logP).",
+            "Use similar retrieved molecules as reference, then give the numeric value only.",
+        ),
         "answer_format": "numeric_or_short_property_value",
-        "abstention_policy": "no_external_free_text_by_default",
     },
     "molecule_description": {
         "required_slots": ("molecule_structure",),
         "sources": {"drugchat_pubchem", "drugchat_chembl"},
         "relations": {"instruction_fact"},
-        "top_k": 2,
+        "top_k": 3,
+        "steps": (
+            "Parse the structure: identify its class, functional groups, or natural-product source.",
+            "Use similar retrieved compound facts as reference.",
+            "Write a concise natural-language description.",
+        ),
         "answer_format": "natural_language_description",
-        "abstention_policy": "use_structure_first",
     },
     "molecule_design": {
         "required_slots": ("design_requirement",),
         "sources": {"drugchat_pubchem", "drugchat_chembl"},
         "relations": {"instruction_fact"},
-        "top_k": 1,
+        "top_k": 3,
+        "steps": (
+            "Read the design requirement (role, class, scaffold, target property).",
+            "Recall similar molecules from the retrieved compound facts.",
+            "Output a molecule string (SELFIES) that satisfies the requirement.",
+        ),
         "answer_format": "molecule_string",
-        "abstention_policy": "avoid_unrelated_facts",
     },
     "biomedical_open_qa": {
         "required_slots": ("question_entities", "biomedical_fact"),
-        "sources": {"primekg", "drugchat_pubchem", "drugchat_chembl"},
+        "sources": {"primekg", "drugchat_pubchem", "drugchat_chembl", "fdarxbench_label"},
         "relations": {
             "indication",
             "off-label use",
@@ -159,26 +175,15 @@ SKILL_SCHEMA_V1: dict[str, dict[str, Any]] = {
             "disease_phenotype_positive",
             "disease_phenotype_negative",
             "instruction_fact",
+            "label_context",
         },
         "top_k": 3,
+        "steps": (
+            "Identify the biomedical entities in the question (drug, disease, protein, pathway).",
+            "Retrieve the relevant relations/facts for those entities.",
+            "Answer concisely from the retrieved facts.",
+        ),
         "answer_format": "concise_biomedical_answer",
-        "abstention_policy": "abstain_if_no_relevant_fact",
-    },
-    "drug_relation_qa": {
-        "required_slots": ("drug_entity", "relation_fact"),
-        "sources": {"primekg", "fdarxbench_label"},
-        "relations": {"indication", "off-label use", "contraindication", "drug_protein", "drug_effect", "drug_drug", "label_context"},
-        "top_k": 3,
-        "answer_format": "short_relation_answer",
-        "abstention_policy": "abstain_if_no_relation_fact",
-    },
-    "unsupported_or_low_evidence": {
-        "required_slots": ("evidence_absence_reason",),
-        "sources": set(),
-        "relations": set(),
-        "top_k": 0,
-        "answer_format": "information_not_found",
-        "abstention_policy": "always_abstain",
     },
 }
 
@@ -277,8 +282,6 @@ def infer_schema_v1_skill(record: dict[str, Any]) -> str:
     if source == "fdarxbench" or record.get("input_type") == "FDA label context":
         if task_type == "multihop":
             return "fda_label_multihop"
-        if task_type == "refusal" or record.get("input_type") == "none":
-            return "fda_label_refusal"
         return "fda_label_factual"
     if "property" in task_type or "molecular weight" in question or "logp" in question:
         return "molecule_property_numeric"
@@ -286,11 +289,6 @@ def infer_schema_v1_skill(record: dict[str, Any]) -> str:
         return "molecule_design"
     if "molecular description" in task_type or "describe" in question:
         return "molecule_description"
-    relation_terms = ("contraindication", "indication", "interact", "target", "protein", "side effect")
-    if any(term in question for term in relation_terms):
-        return "drug_relation_qa"
-    if not question:
-        return "unsupported_or_low_evidence"
     return "biomedical_open_qa"
 
 
@@ -302,7 +300,7 @@ def infer_record_skill(record: dict[str, Any], schema_version: str) -> str:
 
 def skill_config(skill: str, schema_version: str) -> dict[str, Any]:
     if schema_version == "v1":
-        return SKILL_SCHEMA_V1.get(skill, SKILL_SCHEMA_V1["unsupported_or_low_evidence"])
+        return SKILL_SCHEMA_V1.get(skill, SKILL_SCHEMA_V1["biomedical_open_qa"])
     return LEGACY_SKILL_CONFIG.get(skill, LEGACY_SKILL_CONFIG["biomedical_open_qa"])
 
 
@@ -444,24 +442,20 @@ def evidence_block(evidence: list[dict[str, Any]], max_chars: int) -> str:
 
 
 def build_prompt(record: dict[str, Any], skill: str, method: str, evidence: list[dict[str, Any]], max_chars: int) -> str:
+    # Minimal baseline prompt: instruction + the question's own label/context +
+    # the retrieved evidence + question/answer. No skill/method/task metadata, so
+    # every retrieval baseline shares an identical prompt and the ONLY thing that
+    # differs is the content of "Retrieved KB evidence" (i.e. which retriever ran).
     lines = [
         "You are answering a drug and molecular QA task with external knowledge.",
-        "Use the provided label context and retrieved KB evidence only when relevant.",
-        "If the evidence does not support an answer, say: Information not found!",
-        "Return only the final answer in the same style as the gold answer.",
         "",
-        f"Skill: {skill}",
-        f"Retrieval method: {method}",
-        f"Task: {record.get('task_type', '')}",
-        f"Input type: {record.get('input_type', '')}",
+        "Use the provided information to answer the question. If the answer is not available, respond: Information not found!",
+        "",
+        "Answer in the same style as the gold answer.",
     ]
-    if record.get("drug_name"):
-        lines.append(f"Drug: {record['drug_name']}")
     if record.get("input_molecule_or_context"):
         label = "Label/context evidence" if record.get("source") == "fdarxbench" else "Input"
         lines.extend(["", f"{label}:", str(record["input_molecule_or_context"])])
-    if record.get("decoded_smiles"):
-        lines.append(f"Decoded SMILES: {record['decoded_smiles']}")
     lines.extend(["", "Retrieved KB evidence:", evidence_block(evidence, max_chars)])
     lines.extend(["", f"Question: {record.get('question', '')}", "Answer:"])
     return "\n".join(lines)
@@ -515,33 +509,27 @@ def build_completed_skill_prompt(
     evidence: list[dict[str, Any]],
     max_chars: int,
 ) -> str:
+    # Same instruction + known information + Question/Answer as the baseline prompt.
+    # The skill layer adds three things: the routed skill, its ordered solving steps,
+    # the answer format, and skill-based (source-constrained) retrieved knowledge in
+    # place of the baseline's generic evidence dump.
     config = skill_config(skill, "v1")
-    slots = evidence_slot_fills(record, skill, evidence)
     lines = [
-        "You are answering a drug and molecular QA task using a completed skill schema.",
-        "Use only the filled evidence slots that are relevant to the question.",
-        "If a required slot is unfilled and the answer cannot be supported, say: Information not found!",
-        "Return only the final answer in the requested answer format.",
+        "You are answering a drug and molecular QA task with external knowledge.",
+        "",
+        "Use the provided information to answer the question. If the answer is not available, respond: Information not found!",
+        "",
+        "Answer in the same style as the gold answer.",
         "",
         f"Skill: {skill}",
-        f"Answer format: {config['answer_format']}",
-        f"Abstention policy: {config['abstention_policy']}",
-        f"Retrieval method: {method}",
-        f"Task: {record.get('task_type', '')}",
-        f"Input type: {record.get('input_type', '')}",
+        "How to solve:",
     ]
-    if record.get("drug_name"):
-        lines.append(f"Drug: {record['drug_name']}")
+    for i, step in enumerate(config.get("steps", ()), 1):
+        lines.append(f"  {i}. {step}")
+    lines.append(f"Answer format: {config['answer_format']}")
     if record.get("input_molecule_or_context"):
-        label = "Label/context evidence" if record.get("source") == "fdarxbench" else "Input"
-        lines.extend(["", f"{label}:", str(record["input_molecule_or_context"])])
-    if record.get("decoded_smiles"):
-        lines.append(f"Decoded SMILES: {record['decoded_smiles']}")
-    lines.extend(["", "Required evidence slots:"])
-    for slot, status in slots.items():
-        state = "filled" if status["filled"] else "missing"
-        lines.append(f"- {slot}: {state}")
-    lines.extend(["", "Retrieved KB evidence:", evidence_block(evidence, max_chars)])
+        lines.extend(["", "Known information:", str(record["input_molecule_or_context"])])
+    lines.extend(["", "Skill-based retrieved knowledge:", evidence_block(evidence, max_chars)])
     lines.extend(["", f"Question: {record.get('question', '')}", "Answer:"])
     return "\n".join(lines)
 
