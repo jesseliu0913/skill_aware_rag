@@ -193,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--kb-dir", default="outputs/knowledge_bank/unified")
-    parser.add_argument("--method", default="skill_hybrid", choices=["bm25", "kg", "hybrid", "skill_hybrid"])
+    parser.add_argument("--method", default="skill_hybrid", choices=["bm25", "kg", "hybrid", "skill_hybrid", "bm25_skillrouted"])
     parser.add_argument("--schema-version", default="legacy", choices=["legacy", "v1"])
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
@@ -370,8 +370,10 @@ def retrieve(
     schema_version: str,
 ) -> list[dict[str, Any]]:
     skill = infer_record_skill(record, schema_version)
-    use_skill_filter = method == "skill_hybrid"
-    if schema_version == "v1":
+    # bm25_skillrouted = pure bm25 scoring (no alias boost) + skill source filter,
+    # k NOT capped -> isolates *routing* from evidence-budget vs plain bm25.
+    use_skill_filter = method in {"skill_hybrid", "bm25_skillrouted"}
+    if schema_version == "v1" and method != "bm25_skillrouted":
         top_k = min(top_k, int(skill_config(skill, schema_version)["top_k"]))
     if top_k <= 0:
         return []

@@ -14,7 +14,7 @@
 #          preds     outputs/baseline_rag/predictions_bsl/<model>_<ds>_<method>_bsl_test.jsonl
 #
 # Env: MODELS DATASETS METHODS LIMIT MAX_NEW_TOKENS MAX_STEPS SAVE_STEPS MAX_LENGTH
-#      FORCE_AUGMENT=1 (default here, since the prompt changed) DRY_RUN=1.
+#      PARTITION FORCE_AUGMENT=1 (default here, since the prompt changed) DRY_RUN=1.
 set -euo pipefail
 cd /playpen-jfs/jesse/drug_microbiome
 
@@ -26,8 +26,8 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-160}"
 MAX_STEPS="${MAX_STEPS:-1125}"; SAVE_STEPS="${SAVE_STEPS:-375}"; MAX_LENGTH="${MAX_LENGTH:-2048}"
 FORCE_AUGMENT="${FORCE_AUGMENT:-1}"
 DRY_RUN="${DRY_RUN:-0}"
-ACCOUNT="${ACCOUNT:-jesseliu}"; QOS="${QOS:-normal}"
-SB=(--account="$ACCOUNT" --qos="$QOS")
+ACCOUNT="${ACCOUNT:-jesseliu}"; QOS="${QOS:-normal}"; PARTITION="${PARTITION:-a100}"
+SB=(--account="$ACCOUNT" --qos="$QOS" --partition="$PARTITION")
 
 declare -A MODEL_PATHS=(
   [qwen2_5_7b]="/playpen-shared/jesse/cache/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"

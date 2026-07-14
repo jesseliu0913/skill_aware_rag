@@ -23,9 +23,11 @@ export HF_HUB_OFFLINE=1
 : "${METHOD:?Set METHOD to dense_bge|dense_medcpt|rrf|rerank}"
 
 LIMIT="${LIMIT:-0}"
+SCHEMA="${SCHEMA:-legacy}"
 
 /playpen-shared/jesse/miniconda3/envs/agentskill/bin/python skill_aware_rag/retrieval/augment_baseline_rag.py \
   --input "$INPUT" \
   --output "$OUTPUT" \
   --method "$METHOD" \
+  --schema-version "$SCHEMA" \
   --limit "$LIMIT"

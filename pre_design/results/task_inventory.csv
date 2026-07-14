@@ -1,0 +1,8 @@
+dataset,question_type,task_type,input_type
+fdarxbench,fda_factual,factual,FDA label context
+fdarxbench,fda_multihop,multihop,FDA label context
+fdarxbench,fda_refusal,refusal,none
+mol_instructions,biomedical_open_qa,Open Question,none
+mol_instructions,molecule_description,molecular description generation,SELFIES
+mol_instructions,molecule_design,description-guided molecule design,text
+mol_instructions,molecule_property,property prediction,SELFIES

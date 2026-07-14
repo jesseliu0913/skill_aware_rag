@@ -31,6 +31,7 @@ PYTHON=/playpen-shared/jesse/miniconda3/envs/agentskill/bin/python
 # Map the display label to augmenter flags, matching the existing test runs.
 case "$METHOD" in
   skill_schema_v1) AUG_METHOD=skill_hybrid; SCHEMA=v1 ;;
+  bm25_skillrouted) AUG_METHOD=bm25_skillrouted; SCHEMA=v1 ;;
   bm25|kg|hybrid|skill_hybrid) AUG_METHOD="$METHOD"; SCHEMA=legacy ;;
   *) echo "Unknown METHOD=$METHOD" >&2; exit 2 ;;
 esac
