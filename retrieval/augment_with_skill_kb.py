@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -195,6 +196,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kb-dir", default="outputs/knowledge_bank/unified")
     parser.add_argument("--method", default="skill_hybrid", choices=["bm25", "kg", "hybrid", "skill_hybrid", "bm25_skillrouted"])
     parser.add_argument("--schema-version", default="legacy", choices=["legacy", "v1"])
+    parser.add_argument(
+        "--skill-override",
+        default="none",
+        choices=["none", "oracle", "random", "wrong", "predicted"],
+        help=(
+            "Force the routed skill for Exp06 controls. 'none' (default) keeps the "
+            "current gold-field routing byte-identical; 'oracle' = gold-field skill; "
+            "'predicted' = question-only deployable router; 'random' = deterministic "
+            "sha1(id)-hashed skill; 'wrong' = deterministic confusion-map skill."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--max-facts", type=int, default=0, help="Debug limit for KB facts.")
@@ -292,7 +304,101 @@ def infer_schema_v1_skill(record: dict[str, Any]) -> str:
     return "biomedical_open_qa"
 
 
-def infer_record_skill(record: dict[str, Any], schema_version: str) -> str:
+# ---------------------------------------------------------------------------
+# Exp06 skill-override controls. The routed skill is the only thing these touch;
+# everything downstream (source filter, prompt, slots) follows from it. The
+# default `skill_override="none"` bypasses ALL of this so the produced records
+# are byte-identical to the pre-Exp06 pipeline.
+#
+# NOTE: the *current* routers (infer_skill / infer_schema_v1_skill) read gold
+# task fields (source / task_type / input_type), so the deployed-as-is routing
+# already IS the gold-field (oracle) skill. `--skill-override predicted` swaps in
+# a question-ONLY router that is what a real deployment could use.
+SKILL_NAMES_V1: tuple[str, ...] = tuple(SKILL_SCHEMA_V1.keys())
+SKILL_NAMES_LEGACY: tuple[str, ...] = tuple(LEGACY_SKILL_CONFIG.keys())
+
+# Fixed plausible-but-wrong confusion map: each gold skill -> one other skill
+# (deterministic, and never the identity), for the wrong-skill sensitivity control.
+CONFUSION_MAP_V1: dict[str, str] = {
+    "fda_label_factual": "fda_label_multihop",
+    "fda_label_multihop": "fda_label_factual",
+    "molecule_property_numeric": "molecule_description",
+    "molecule_description": "molecule_property_numeric",
+    "molecule_design": "molecule_description",
+    "biomedical_open_qa": "fda_label_factual",
+}
+CONFUSION_MAP_LEGACY: dict[str, str] = {
+    "fda_label_qa": "biomedical_open_qa",
+    "molecule_property": "molecule_description",
+    "molecule_description": "molecule_property",
+    "molecule_design": "molecule_description",
+    "biomedical_open_qa": "fda_label_qa",
+}
+
+
+def skill_names(schema_version: str) -> tuple[str, ...]:
+    return SKILL_NAMES_V1 if schema_version == "v1" else SKILL_NAMES_LEGACY
+
+
+def gold_field_skill(record: dict[str, Any], schema_version: str) -> str:
+    """The current gold-field router (reads source/task_type/input_type)."""
+    if schema_version == "v1":
+        return infer_schema_v1_skill(record)
+    return infer_skill(record)
+
+
+def predict_skill_question_only(record: dict[str, Any], schema_version: str = "v1") -> str:
+    """Deployable router: infer the skill from ONLY ``record["question"]`` text.
+
+    Unlike ``gold_field_skill``, this reads NO gold task fields (source,
+    task_type, input_type, decoded_smiles), so it is safe to deploy. Cue-based:
+    lexical patterns in the question decide the skill.
+    """
+    question = norm_text(record.get("question", ""))
+    v1 = schema_version == "v1"
+    if any(cue in question for cue in ("design", "generate a molecule", "synthesize", "create a molecule", "propose a molecule")):
+        return "molecule_design"
+    if any(cue in question for cue in ("logp", "molecular weight", "homo-lumo", "how many", "predict the", "solubility", "what is the value")):
+        return "molecule_property_numeric" if v1 else "molecule_property"
+    if any(cue in question for cue in ("describe", "description", "what type of molecule", "what kind of molecule")):
+        return "molecule_description"
+    if any(cue in question for cue in ("contraindicat", "indicat", "dosage", "dose", "adverse", "warning", "label", "boxed", "black box")):
+        if any(cue in question for cue in (" and ", " both ", "combined", "as well as", "in addition", "along with")):
+            return "fda_label_multihop" if v1 else "fda_label_qa"
+        return "fda_label_factual" if v1 else "fda_label_qa"
+    return "biomedical_open_qa"
+
+
+def random_skill(record: dict[str, Any], schema_version: str) -> str:
+    """Deterministic pseudo-random skill via sha1(id) mod n_skills (negative control)."""
+    names = skill_names(schema_version)
+    digest = hashlib.sha1(str(record.get("id", "")).encode("utf-8")).hexdigest()
+    return names[int(digest, 16) % len(names)]
+
+
+def wrong_skill(record: dict[str, Any], schema_version: str) -> str:
+    """Deterministic plausible-but-wrong skill from a fixed confusion map."""
+    gold = gold_field_skill(record, schema_version)
+    cmap = CONFUSION_MAP_V1 if schema_version == "v1" else CONFUSION_MAP_LEGACY
+    fallback = "biomedical_open_qa" if gold != "biomedical_open_qa" else skill_names(schema_version)[0]
+    return cmap.get(gold, fallback)
+
+
+def apply_skill_override(record: dict[str, Any], schema_version: str, skill_override: str) -> str:
+    if skill_override == "oracle":
+        return gold_field_skill(record, schema_version)
+    if skill_override == "predicted":
+        return predict_skill_question_only(record, schema_version)
+    if skill_override == "random":
+        return random_skill(record, schema_version)
+    if skill_override == "wrong":
+        return wrong_skill(record, schema_version)
+    return gold_field_skill(record, schema_version)
+
+
+def infer_record_skill(record: dict[str, Any], schema_version: str, skill_override: str = "none") -> str:
+    if skill_override and skill_override != "none":
+        return apply_skill_override(record, schema_version, skill_override)
     if schema_version == "v1":
         return infer_schema_v1_skill(record)
     return infer_skill(record)
@@ -368,8 +474,9 @@ def retrieve(
     top_k: int,
     max_candidate_facts: int,
     schema_version: str,
+    skill_override: str = "none",
 ) -> list[dict[str, Any]]:
-    skill = infer_record_skill(record, schema_version)
+    skill = infer_record_skill(record, schema_version, skill_override)
     # bm25_skillrouted = pure bm25 scoring (no alias boost) + skill source filter,
     # k NOT capped -> isolates *routing* from evidence-budget vs plain bm25.
     use_skill_filter = method in {"skill_hybrid", "bm25_skillrouted"}
@@ -542,9 +649,10 @@ def augment_record(
     method: str,
     max_chars: int,
     schema_version: str,
+    skill_override: str = "none",
 ) -> dict[str, Any]:
     new_record = dict(record)
-    skill = infer_record_skill(record, schema_version)
+    skill = infer_record_skill(record, schema_version, skill_override)
     config = skill_config(skill, schema_version)
     skill_schema = {
         "skill": skill,
@@ -609,9 +717,19 @@ def main() -> None:
             args.top_k,
             args.max_candidate_facts,
             args.schema_version,
+            args.skill_override,
         )
-        augmented.append(augment_record(record, evidence, args.method, args.max_prompt_evidence_chars, args.schema_version))
-        skill_counts[infer_record_skill(record, args.schema_version)] += 1
+        augmented.append(
+            augment_record(
+                record,
+                evidence,
+                args.method,
+                args.max_prompt_evidence_chars,
+                args.schema_version,
+                args.skill_override,
+            )
+        )
+        skill_counts[infer_record_skill(record, args.schema_version, args.skill_override)] += 1
         evidence_counts["with_evidence" if evidence else "without_evidence"] += 1
     write_jsonl(Path(args.output), augmented)
     summary = {
@@ -620,6 +738,7 @@ def main() -> None:
         "kb_dir": args.kb_dir,
         "method": args.method,
         "schema_version": args.schema_version,
+        "skill_override": args.skill_override,
         "limit": args.limit,
         "records": len(records),
         "facts_loaded": len(facts),
