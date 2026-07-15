@@ -71,13 +71,20 @@ BSLRET_RE = re.compile(
     r"(?P<method>bm25|kg|hybrid|skill_hybrid|dense_bge|dense_medcpt|rrf|rerank|skill_schema_v1)_"
     r"(?P<variant>bslret)_test_eval\.json$"
 )
+# FDA label context removed at train and test; retrieval remains at test.
+NOLABEL_RE = re.compile(
+    r"^(?P<model>qwen2_5_7b|qwen2_5_3b|llama3_2_3b)_"
+    r"(?P<dataset>fdarxbench)_"
+    r"(?P<method>none|bm25|kg|hybrid|skill_hybrid|dense_bge|dense_medcpt|rrf|rerank|skill_schema_v1)_"
+    r"(?P<variant>nolabel)_test_eval\.json$"
+)
 
 
 def collect(pred_dir: Path, rows: list[dict]) -> None:
     if not pred_dir.is_dir():
         return
     for f in sorted(pred_dir.glob("*_eval.json")):
-        for regex, method_default in ((BASELINE_RE, None), (EXISTING_RE, None), (RAWQ_RE, None), (BSL_RE, None), (BSLRET_RE, None), (PLAIN_RE, "none")):
+        for regex, method_default in ((BASELINE_RE, None), (EXISTING_RE, None), (RAWQ_RE, None), (BSL_RE, None), (BSLRET_RE, None), (NOLABEL_RE, None), (PLAIN_RE, "none")):
             m = regex.match(f.name)
             if not m:
                 continue

@@ -1,0 +1,7 @@
+model,dataset,evaluation_n,fixed_method,fixed_utility,personalized_utility,absolute_gain
+llama3_2_3b,fdarxbench,483,rrf,0.777657,0.779467,0.00181
+llama3_2_3b,mol_instructions,483,kg,0.31972,0.31972,0.0
+qwen2_5_3b,fdarxbench,483,dense_bge,0.760946,0.761141,0.000195
+qwen2_5_3b,mol_instructions,483,kg,0.322803,0.323946,0.001143
+qwen2_5_7b,fdarxbench,483,kg,0.781939,0.781939,0.0
+qwen2_5_7b,mol_instructions,483,kg,0.323327,0.322915,-0.000412

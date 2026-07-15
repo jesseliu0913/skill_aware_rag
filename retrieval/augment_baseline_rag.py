@@ -41,9 +41,19 @@ from retrievers import (  # noqa: E402
 
 DENSE_FOR_METHOD = {
     "dense_bge": "bge",
+    "dense_bge_locked": "bge",
+    "dense_bge_skillrouted": "bge",
     "dense_medcpt": "medcpt",
     "rrf": "bge",
     "rerank": "bge",
+}
+
+# Skill-style source lock: restrict the dense candidate pool to one KB source
+# before ranking, so a fixed budget k digs deeper into the relevant source
+# instead of spending slots on off-source distractors. Same retriever/k as the
+# unlocked twin, so the lock is the only independent variable.
+LOCK_SOURCE_FOR_METHOD = {
+    "dense_bge_locked": "fdarxbench_label",
 }
 
 
@@ -56,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--emb-dir", default=str(REPO / "outputs/knowledge_bank/embeddings"))
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--top-k", type=int, default=8)
+    p.add_argument("--schema-version", default="legacy", choices=["legacy", "v1"],
+                   help="v1 wraps the dense evidence in the completed skill-schema prompt "
+                        "(steps + answer_format); legacy uses the plain baseline prompt.")
     p.add_argument("--first-stage-k", type=int, default=50, help="Candidates before RRF/rerank.")
     p.add_argument("--max-candidate-facts", type=int, default=20000)
     p.add_argument("--max-prompt-evidence-chars", type=int, default=3500)
@@ -108,7 +121,22 @@ def main() -> None:
     dense_name = DENSE_FOR_METHOD[method]
     print(f"[augment] method={method} dense={dense_name} records={len(records)}", flush=True)
     kb_matrix = load_embeddings(Path(args.emb_dir), dense_name, fact_id_to_idx, len(facts))
-    dense_index = DenseIndex(kb_matrix)
+
+    # Source lock: build the dense index over only the locked-source rows and keep
+    # a map back to global fact indices, so search returns global indices unchanged
+    # for the rest of the pipeline.
+    lock_source = LOCK_SOURCE_FOR_METHOD.get(method)
+    if lock_source:
+        sub_to_global = np.array(
+            [i for i, f in enumerate(facts) if f.get("source") == lock_source], dtype=np.int64
+        )
+        if sub_to_global.size == 0:
+            raise SystemExit(f"No KB facts with source={lock_source!r} for method={method}.")
+        dense_index = DenseIndex(kb_matrix[sub_to_global])
+        print(f"[augment] source-locked to {lock_source}: {sub_to_global.size} candidate facts", flush=True)
+    else:
+        sub_to_global = None
+        dense_index = DenseIndex(kb_matrix)
     encoder = build_encoder(dense_name, device=args.device)
 
     queries = [base.query_text(r) for r in records]
@@ -117,8 +145,13 @@ def main() -> None:
     needs_lexical = method in {"rrf", "rerank"}
     cross = MedCPTCrossEncoder(device=args.device) if method == "rerank" else None
 
-    # First-stage dense candidates for everyone.
-    dense_scores, dense_idxs = dense_index.search(q_vecs, max(args.first_stage_k, args.top_k))
+    # First-stage dense candidates for everyone. skillrouted filters this pool by
+    # each record's routed-skill sources, so it needs a deeper pool to survive it.
+    search_k = 300 if method == "dense_bge_skillrouted" else max(args.first_stage_k, args.top_k)
+    dense_scores, dense_idxs = dense_index.search(q_vecs, search_k)
+    if sub_to_global is not None:
+        # Map locked sub-index rows back to global fact indices.
+        dense_idxs = np.where(dense_idxs >= 0, sub_to_global[np.clip(dense_idxs, 0, None)], -1)
 
     augmented = []
     skill_counts: Counter[str] = Counter()
@@ -127,7 +160,17 @@ def main() -> None:
         d_idx = [int(x) for x in dense_idxs[i] if x >= 0]
         d_score = {int(idx): float(s) for idx, s in zip(dense_idxs[i], dense_scores[i]) if idx >= 0}
 
-        if method in {"dense_bge", "dense_medcpt"}:
+        if method == "dense_bge_skillrouted":
+            # Per-record source routing: keep only dense candidates whose source is
+            # allowed for this record's routed skill (FDA->label, molecule->drugchat,
+            # open->primekg+drugchat), then take top-k. This is the ONLY difference
+            # from dense_bge -- same retriever, same k, same prompt schema.
+            skill = base.infer_record_skill(record, "v1")
+            allowed = base.SKILL_SCHEMA_V1.get(skill, {}).get("sources") or set()
+            routed = [idx for idx in d_idx if facts[idx].get("source") in allowed] if allowed else d_idx
+            chosen = routed[: args.top_k]
+            evidence = [fact_to_evidence(facts[idx], d_score.get(idx, 0.0)) for idx in chosen]
+        elif method in {"dense_bge", "dense_bge_locked", "dense_medcpt"}:
             chosen = d_idx[: args.top_k]
             evidence = [fact_to_evidence(facts[idx], d_score.get(idx, 0.0)) for idx in chosen]
         else:
@@ -144,7 +187,7 @@ def main() -> None:
                 order = np.argsort(-ce_scores)[: args.top_k]
                 evidence = [fact_to_evidence(facts[cand[j]], float(ce_scores[j])) for j in order]
 
-        new_record = base.augment_record(record, evidence, method, args.max_prompt_evidence_chars, "legacy")
+        new_record = base.augment_record(record, evidence, method, args.max_prompt_evidence_chars, args.schema_version)
         augmented.append(new_record)
         skill_counts[base.infer_record_skill(record, "legacy")] += 1
         evidence_counts["with_evidence" if evidence else "without_evidence"] += 1

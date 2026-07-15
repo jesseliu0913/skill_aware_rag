@@ -49,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdarx-train", type=int, default=3000)
     parser.add_argument("--fdarx-dev", type=int, default=0)
     parser.add_argument("--fdarx-test", type=int, default=1000)
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=["mol_instructions", "fdarxbench"],
+        choices=["mol_instructions", "fdarxbench"],
+        help="Which datasets to (re)build. Others are left untouched on disk.",
+    )
     return parser.parse_args()
 
 
@@ -77,15 +84,40 @@ def split_records(
     return splits
 
 
+def _official_split(row: dict[str, Any]) -> str:
+    meta = row.get("metadata") or {}
+    return str(meta.get("split", "train"))
+
+
 def build_mol_instructions(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
-    by_source: dict[str, list[dict[str, Any]]] = {}
+    # Respect Mol-Instructions' OWN train/test split (metadata.split). The train
+    # split is sampled from a bounded pool of official-train rows (source-read-limit,
+    # matching the historical read window, which was all-train anyway because the
+    # official test rows sit at the END of each file); the test split is sampled
+    # exclusively from official-test rows. This replaces the old blind shuffle,
+    # which drew the "test" set from the official-train pool and never touched the
+    # official test set.
+    by_source_train: dict[str, list[dict[str, Any]]] = {}
+    by_source_test: dict[str, list[dict[str, Any]]] = {}
     all_records: list[dict[str, Any]] = []
     for source_name, source_path in MOL_INSTRUCTION_SOURCES:
         path = Path(source_path)
-        rows = load_json_rows(path, args.source_read_limit)
-        records = [normalize_record(source_name, path, idx, row) for idx, row in enumerate(rows)]
-        by_source[source_name] = records
-        all_records.extend(records)
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise TypeError(f"{path} must contain a JSON list")
+        train_pool, test_rows = [], []
+        for idx, row in enumerate(data):
+            if _official_split(row) == "test":
+                test_rows.append((idx, row))
+            elif len(train_pool) < args.source_read_limit:
+                train_pool.append((idx, row))
+        train_records = [normalize_record(source_name, path, idx, row) for idx, row in train_pool]
+        test_records = [normalize_record(source_name, path, idx, row) for idx, row in test_rows]
+        by_source_train[source_name] = train_records
+        by_source_test[source_name] = test_records
+        all_records.extend(train_records)
+        all_records.extend(test_records)
 
     kg_index = build_kg_evidence(
         Path(args.kg_file),
@@ -102,23 +134,29 @@ def build_mol_instructions(args: argparse.Namespace, output_dir: Path) -> dict[s
         )
         finalize_record(record)
 
-    split_sizes = {
-        "train": args.mol_train_per_source,
-        "test": args.mol_test_per_source,
+    rng = random.Random(args.seed)
+
+    def sample(by_source: dict[str, list[dict[str, Any]]], per_source: int) -> list[dict[str, Any]]:
+        picked: list[dict[str, Any]] = []
+        for records in by_source.values():
+            shuffled = list(records)
+            rng.shuffle(shuffled)
+            picked.extend(shuffled if per_source <= 0 else shuffled[:per_source])
+        return picked
+
+    splits = {
+        "train": sample(by_source_train, args.mol_train_per_source),
+        "test": sample(by_source_test, args.mol_test_per_source),
     }
-    if args.mol_dev_per_source > 0:
-        split_sizes = {
-            "train": args.mol_train_per_source,
-            "dev": args.mol_dev_per_source,
-            "test": args.mol_test_per_source,
-        }
-    splits = split_records(by_source, split_sizes, random.Random(args.seed))
     target_dir = output_dir / "mol_instructions"
     for split_name, records in splits.items():
         write_jsonl(target_dir / f"{split_name}.jsonl", records)
 
     return {
-        "sources": {source: len(records) for source, records in by_source.items()},
+        "sources": {
+            source: {"train_pool": len(by_source_train[source]), "test_pool": len(by_source_test[source])}
+            for source in by_source_train
+        },
         "splits": {split: len(records) for split, records in splits.items()},
         "with_kg_evidence": sum(bool(r["retrieved_kg_evidence"]) for r in all_records),
         "with_molecule_evidence": sum(bool(r["retrieved_molecule_evidence"]) for r in all_records),
@@ -229,12 +267,14 @@ def build_fdarxbench(args: argparse.Namespace, output_dir: Path) -> dict[str, An
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
-    summary = {
-        "mol_instructions": build_mol_instructions(args, output_dir),
-        "fdarxbench": build_fdarxbench(args, output_dir),
+    builders = {
+        "mol_instructions": build_mol_instructions,
+        "fdarxbench": build_fdarxbench,
     }
+    summary = {name: builders[name](args, output_dir) for name in args.datasets}
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
+    summary_path = output_dir / ("summary.json" if set(args.datasets) == set(builders) else "summary_mol.json")
+    with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(json.dumps(summary, indent=2))
 
