@@ -188,6 +188,33 @@ SKILL_SCHEMA_V1: dict[str, dict[str, Any]] = {
 }
 
 
+# Schema components that Exp04 (RQ5) can ablate. When a component is listed in
+# `--ablate` it is REMOVED from the skill prompt/route, so the additive grid
+# "uniform RAG -> full SkillRAG" is obtained by removing more/fewer components.
+# The empty set (default) is the full schema and reproduces the current output
+# byte-for-byte.
+ABLATABLE_COMPONENTS = ("skill_id", "source_routing", "solving_steps", "answer_format", "evidence_org")
+
+
+def parse_ablate(spec: Any) -> set[str]:
+    """Parse an --ablate spec into a validated set of components to REMOVE.
+
+    None / empty -> empty set -> full schema (unchanged, byte-identical output).
+    Accepts a comma-separated str ("a,b") or an existing iterable of names.
+    """
+    if not spec:
+        return set()
+    if isinstance(spec, (set, frozenset, list, tuple)):
+        components = {str(part).strip() for part in spec}
+    else:
+        components = {part.strip() for part in str(spec).split(",")}
+    components = {part for part in components if part}
+    unknown = components - set(ABLATABLE_COMPONENTS)
+    if unknown:
+        raise ValueError(f"Unknown --ablate components {sorted(unknown)}; valid: {list(ABLATABLE_COMPONENTS)}")
+    return components
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
@@ -200,6 +227,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-facts", type=int, default=0, help="Debug limit for KB facts.")
     parser.add_argument("--max-candidate-facts", type=int, default=20000)
     parser.add_argument("--max-prompt-evidence-chars", type=int, default=3500)
+    parser.add_argument(
+        "--ablate",
+        default="",
+        help=(
+            "Exp04/RQ5 schema ablation. Comma-separated components to REMOVE, "
+            f"subset of {{{','.join(ABLATABLE_COMPONENTS)}}}. Empty (default) keeps "
+            "the full schema and is byte-identical to the un-ablated output. Only "
+            "the v1 skill prompt/route honor these components."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -368,11 +405,15 @@ def retrieve(
     top_k: int,
     max_candidate_facts: int,
     schema_version: str,
+    ablate: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    ablate = ablate or set()
     skill = infer_record_skill(record, schema_version)
     # bm25_skillrouted = pure bm25 scoring (no alias boost) + skill source filter,
     # k NOT capped -> isolates *routing* from evidence-budget vs plain bm25.
-    use_skill_filter = method in {"skill_hybrid", "bm25_skillrouted"}
+    # Ablating "source_routing" drops the skill source filter so retrieval runs
+    # unconstrained over the whole KB, like the uniform methods.
+    use_skill_filter = method in {"skill_hybrid", "bm25_skillrouted"} and "source_routing" not in ablate
     if schema_version == "v1" and method != "bm25_skillrouted":
         top_k = min(top_k, int(skill_config(skill, schema_version)["top_k"]))
     if top_k <= 0:
@@ -510,11 +551,16 @@ def build_completed_skill_prompt(
     method: str,
     evidence: list[dict[str, Any]],
     max_chars: int,
+    ablate: set[str] | None = None,
 ) -> str:
     # Same instruction + known information + Question/Answer as the baseline prompt.
     # The skill layer adds three things: the routed skill, its ordered solving steps,
     # the answer format, and skill-based (source-constrained) retrieved knowledge in
     # place of the baseline's generic evidence dump.
+    #
+    # `ablate` (Exp04/RQ5) REMOVES individual schema components; the empty/None
+    # default keeps every component and is byte-identical to the un-ablated prompt.
+    ablate = ablate or set()
     config = skill_config(skill, "v1")
     lines = [
         "You are answering a drug and molecular QA task with external knowledge.",
@@ -522,16 +568,24 @@ def build_completed_skill_prompt(
         "Use the provided information to answer the question. If the answer is not available, respond: Information not found!",
         "",
         "Answer in the same style as the gold answer.",
-        "",
-        f"Skill: {skill}",
-        "How to solve:",
     ]
-    for i, step in enumerate(config.get("steps", ()), 1):
-        lines.append(f"  {i}. {step}")
-    lines.append(f"Answer format: {config['answer_format']}")
+    schema_lines: list[str] = []
+    if "skill_id" not in ablate:
+        schema_lines.append(f"Skill: {skill}")
+    if "solving_steps" not in ablate:
+        schema_lines.append("How to solve:")
+        for i, step in enumerate(config.get("steps", ()), 1):
+            schema_lines.append(f"  {i}. {step}")
+    if "answer_format" not in ablate:
+        schema_lines.append(f"Answer format: {config['answer_format']}")
+    if schema_lines:
+        lines.append("")
+        lines.extend(schema_lines)
     if record.get("input_molecule_or_context"):
         lines.extend(["", "Known information:", str(record["input_molecule_or_context"])])
-    lines.extend(["", "Skill-based retrieved knowledge:", evidence_block(evidence, max_chars)])
+    # Ablating "evidence_org" falls back to the plain baseline evidence dump header.
+    evidence_header = "Retrieved KB evidence:" if "evidence_org" in ablate else "Skill-based retrieved knowledge:"
+    lines.extend(["", evidence_header, evidence_block(evidence, max_chars)])
     lines.extend(["", f"Question: {record.get('question', '')}", "Answer:"])
     return "\n".join(lines)
 
@@ -542,7 +596,9 @@ def augment_record(
     method: str,
     max_chars: int,
     schema_version: str,
+    ablate: set[str] | None = None,
 ) -> dict[str, Any]:
+    ablate = ablate or set()
     new_record = dict(record)
     skill = infer_record_skill(record, schema_version)
     config = skill_config(skill, schema_version)
@@ -562,6 +618,10 @@ def augment_record(
             "abstain_if_missing": True,
         },
     }
+    # Only record the ablated component set when non-empty, so an un-ablated run
+    # (ablate=None/empty) emits a byte-identical skill_schema.
+    if ablate:
+        skill_schema["ablate"] = sorted(ablate)
     new_record["skill_schema"] = skill_schema
     new_record["retrieved_kb_evidence"] = evidence
     if schema_version == "v1":
@@ -571,7 +631,7 @@ def augment_record(
             "filled_slots": [slot for slot, item in new_record["evidence_slots"].items() if item["filled"]],
             "missing_slots": [slot for slot, item in new_record["evidence_slots"].items() if not item["filled"]],
         }
-        new_record["completed_skill_prompt"] = build_completed_skill_prompt(new_record, skill, method, evidence, max_chars)
+        new_record["completed_skill_prompt"] = build_completed_skill_prompt(new_record, skill, method, evidence, max_chars, ablate)
         new_record["prompt"] = new_record["completed_skill_prompt"]
     else:
         new_record["prompt"] = build_prompt(new_record, skill, method, evidence, max_chars)
@@ -591,6 +651,7 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     args = parse_args()
+    ablate = parse_ablate(args.ablate)
     facts, alias_index, idf, token_index = load_kb(Path(args.kb_dir), args.max_facts)
     fact_id_to_idx = {fact["id"]: idx for idx, fact in enumerate(facts)}
     records = iter_jsonl(Path(args.input), args.limit)
@@ -609,8 +670,9 @@ def main() -> None:
             args.top_k,
             args.max_candidate_facts,
             args.schema_version,
+            ablate,
         )
-        augmented.append(augment_record(record, evidence, args.method, args.max_prompt_evidence_chars, args.schema_version))
+        augmented.append(augment_record(record, evidence, args.method, args.max_prompt_evidence_chars, args.schema_version, ablate))
         skill_counts[infer_record_skill(record, args.schema_version)] += 1
         evidence_counts["with_evidence" if evidence else "without_evidence"] += 1
     write_jsonl(Path(args.output), augmented)
@@ -626,6 +688,8 @@ def main() -> None:
         "skill_counts": dict(skill_counts),
         "evidence_counts": dict(evidence_counts),
     }
+    if ablate:
+        summary["ablate"] = sorted(ablate)
     summary_path = Path(args.output).with_suffix(".summary.json")
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
