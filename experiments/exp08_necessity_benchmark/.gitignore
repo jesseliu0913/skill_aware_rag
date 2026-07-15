@@ -1,0 +1,3 @@
+# Generated probe data (candidates.jsonl, provenance.jsonl, build_stats.json).
+# Regenerate with build_necessity_probe.py; only code + SPEC/README/RESULTS ship.
+candidates/
