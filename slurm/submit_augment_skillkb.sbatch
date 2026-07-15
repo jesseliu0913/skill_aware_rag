@@ -36,9 +36,17 @@ case "$METHOD" in
   *) echo "Unknown METHOD=$METHOD" >&2; exit 2 ;;
 esac
 
+# Additive (Exp05): optional KB_DIR / TOP_K passthrough for stress tests. When
+# unset the command line is byte-identical to before (augmenter defaults:
+# --kb-dir outputs/knowledge_bank/unified, --top-k 8).
+EXTRA=()
+[[ -n "${KB_DIR:-}" ]] && EXTRA+=(--kb-dir "$KB_DIR")
+[[ -n "${TOP_K:-}" ]] && EXTRA+=(--top-k "$TOP_K")
+
 "$PYTHON" skill_aware_rag/retrieval/augment_with_skill_kb.py \
   --input "$INPUT" \
   --output "$OUTPUT" \
   --method "$AUG_METHOD" \
   --schema-version "$SCHEMA" \
-  --limit "$LIMIT"
+  --limit "$LIMIT" \
+  "${EXTRA[@]}"
